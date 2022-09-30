@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 
 impl Default for Config {
@@ -12,5 +10,5 @@ impl Default for Config {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
-    pub data_dir: PathBuf,
+    pub data_dir: String,
 }
