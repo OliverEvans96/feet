@@ -10,5 +10,7 @@ impl Default for Config {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
+    // TODO: data_dir should be a shell-expanded and canonicalized PathBuf
+    // via a custom parser function
     pub data_dir: String,
 }

@@ -17,6 +17,7 @@ csv = "1.1.6"
 toml = "0.5.9"
 shellexpand = "2.1.2"
 xdg = "2.4.1"
+async-trait = "0.1.57"
 
 [dependencies.tokio]
 version = "1.21.2"

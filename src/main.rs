@@ -1,11 +1,17 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use gluesql::prelude::Glue;
 
 use crate::config::Config;
+use crate::glue::{TableName, TableNode};
 
 mod config;
+mod glue;
 
 #[derive(Debug, Parser)]
 struct Opts {
@@ -18,8 +24,12 @@ struct Opts {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Query data
     Query { query: String },
-    List,
+    /// List tables
+    List { subdir: Option<String> },
+    /// Show schema for a table
+    Show { table_name: String },
 }
 
 fn get_xdg_dirs() -> anyhow::Result<xdg::BaseDirectories> {
@@ -41,6 +51,17 @@ fn get_config<P: AsRef<Path>>(path: Option<P>) -> anyhow::Result<Config> {
     }
 
     Ok(parsed_config)
+}
+
+/// Expand and canonicalize path
+fn parse_data_dir(orig: &str) -> anyhow::Result<PathBuf> {
+    let s = shellexpand::tilde(orig);
+    let pb = PathBuf::from_str(&s)?;
+    println!("AA");
+    let can = pb.canonicalize()?;
+
+    println!("BB");
+    Ok(can)
 }
 
 fn list_tables(config: &Config) -> anyhow::Result<Vec<String>> {
@@ -83,15 +104,37 @@ async fn main() -> anyhow::Result<()> {
     dbg!(&opts);
     dbg!(&config);
 
+    // TODO: Parse during Opts::parse
+    let data_dir = parse_data_dir(&config.data_dir)?;
+
+    println!("parsed data dir");
+
+    let store = crate::glue::CsvStore::new(data_dir.clone());
+
+    println!("created store");
+
     match opts.command {
         Command::Query { query } => todo!(),
-        Command::List => {
-            let tables = list_tables(&config)?;
+        Command::List { subdir } => {
+            let sub_name: TableName = subdir.map(|x| x.as_str().into()).unwrap_or_default();
 
-            for table in tables {
-                println!("- {}", table);
-            }
+            // let sub_name: TableName;
+            // if let Some(dir) = subdir {
+            //     let sub_pb: PathBuf = data_dir.join(dir);
+            //     sub_name = TableName::from(subdir)
+            // } else {
+            //     sub_name = TableName::new();
+            // }
+
+            let tables = store.list_tables(&sub_name).await?;
+
+            println!("tables: {:#?}", tables);
+
+            // for table in tables {
+            //     println!("- {}", table);
+            // }
         }
+        Command::Show { table_name } => {}
     }
 
     Ok(())
