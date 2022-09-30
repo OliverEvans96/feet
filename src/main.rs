@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
@@ -12,16 +12,14 @@ struct Opts {
     config: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    println!("Hello, world!");
+fn get_xdg_dirs() -> anyhow::Result<xdg::BaseDirectories> {
+    xdg::BaseDirectories::with_prefix("feet").map_err(Into::into)
+}
 
-    let opts = Opts::parse();
-
-    let xdg_dirs = xdg::BaseDirectories::with_prefix("feet")?;
-
-    let config_path = opts
-        .config
+fn get_config<P: AsRef<Path>>(path: Option<P>) -> anyhow::Result<Config> {
+    let xdg_dirs = get_xdg_dirs()?;
+    let config_path = path
+        .map(|p| p.as_ref().to_owned())
         .or_else(|| xdg_dirs.find_config_file("config.toml"));
 
     let parsed_config;
@@ -31,6 +29,17 @@ async fn main() -> anyhow::Result<()> {
     } else {
         parsed_config = Config::default()
     }
+
+    Ok(parsed_config)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    println!("Hello, world!");
+
+    let opts = Opts::parse();
+
+    let parsed_config = get_config(opts.config)?;
 
     dbg!(parsed_config);
 
