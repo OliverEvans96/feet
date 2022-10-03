@@ -3,19 +3,21 @@ use std::{
     str::FromStr,
 };
 
-use anyhow::Context;
 use clap::{Parser, Subcommand};
 use gluesql::prelude::{Glue, Payload, Value};
+use names::TableIdentifier;
 use ptree::{item::StringItem, TreeBuilder};
 use rustyline::error::ReadlineError;
 
 // use gluesql::core::store::{GStore, GStoreMut};
 
 use crate::config::Config;
-use crate::glue::{TableData, TableName, TableNode};
+use crate::glue::{TableData, TableNode};
+use crate::names::TableName;
 
 mod config;
 mod glue;
+mod names;
 
 use crate::glue::CsvStore;
 
@@ -69,33 +71,33 @@ fn parse_data_dir(orig: &str) -> anyhow::Result<PathBuf> {
     Ok(can)
 }
 
-fn list_tables(config: &Config) -> anyhow::Result<Vec<String>> {
-    let expanded = shellexpand::tilde(&config.data_dir);
-    let data_dir = expanded.to_string();
-    let err_msg = format!("cannot open data_dir: {:?}", &data_dir);
-    let read_dir = std::fs::read_dir(&data_dir).context(err_msg)?;
+// fn list_tables(config: &Config) -> anyhow::Result<Vec<String>> {
+//     let expanded = shellexpand::tilde(&config.data_dir);
+//     let data_dir = expanded.to_string();
+//     let err_msg = format!("cannot open data_dir: {:?}", &data_dir);
+//     let read_dir = std::fs::read_dir(&data_dir).context(err_msg)?;
 
-    let mut tables = Vec::new();
+//     let mut tables = Vec::new();
 
-    for res in read_dir {
-        match res {
-            Ok(entry) => {
-                let path = entry.path();
-                let rel = path.strip_prefix(&data_dir)?;
-                if let Ok(rel_str) = rel.to_owned().into_os_string().into_string() {
-                    tables.push(rel_str)
-                } else {
-                    eprintln!("Non-UTF-8 path: {:?}", rel);
-                }
-            }
-            Err(err) => {
-                eprintln!("err 1: {}", err);
-            }
-        }
-    }
+//     for res in read_dir {
+//         match res {
+//             Ok(entry) => {
+//                 let path = entry.path();
+//                 let rel = path.strip_prefix(&data_dir)?;
+//                 if let Ok(rel_str) = rel.to_owned().into_os_string().into_string() {
+//                     tables.push(rel_str)
+//                 } else {
+//                     eprintln!("Non-UTF-8 path: {:?}", rel);
+//                 }
+//             }
+//             Err(err) => {
+//                 eprintln!("err 1: {}", err);
+//             }
+//         }
+//     }
 
-    Ok(tables)
-}
+//     Ok(tables)
+// }
 
 fn print_payload(payload: Payload) {
     match payload {
@@ -171,7 +173,7 @@ fn add_node_to_tree(
         }
         TableData::Dir => {
             // TODO: don't parse schema for every file
-            let subtables = store.list_tables(&node.name)?;
+            let subtables = store.list_tables(node.name)?;
             last_name.push('/');
             tree.begin_child(last_name);
             for subtable in subtables {
@@ -184,13 +186,11 @@ fn add_node_to_tree(
     Ok(())
 }
 
-fn build_table_tree(store: &CsvStore, subdir: Option<&str>) -> anyhow::Result<StringItem> {
-    let sub_name: TableName = subdir.map(Into::into).unwrap_or_default();
+fn build_table_tree(store: &CsvStore, sub_name: TableName) -> anyhow::Result<StringItem> {
+    let tables = store.list_tables(sub_name.clone())?;
 
-    let tables = store.list_tables(&sub_name)?;
-
-    let tree_title = subdir.unwrap_or("/").to_string();
-    let mut tree = TreeBuilder::new(tree_title);
+    let tree_title: TableIdentifier = sub_name.try_into()?;
+    let mut tree = TreeBuilder::new(tree_title.to_string());
 
     for node in tables {
         add_node_to_tree(&store, &mut tree, node)?;
@@ -244,28 +244,27 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Query { query } => handle_query(&mut glue, &query).await,
         Command::Tree { subdir } => {
-            // let sub_name: TableName = subdir
-            //     .as_ref()
-            //     .map(|x| x.as_str().into())
-            //     .unwrap_or_default();
+            let sub_id = TableIdentifier::new(subdir.unwrap_or_default(), data_dir);
+            let sub_name: TableName = sub_id.try_into()?;
 
             let store = glue.storage.expect("No underlying storage??");
-            // let tables = store.list_tables(&sub_name)?;
 
-            let tree = build_table_tree(&store, subdir.as_deref())?;
+            let tree = build_table_tree(&store, sub_name)?;
 
             ptree::print_tree(&tree)?;
         }
         Command::List { subdir } => {
-            let sub_name: TableName = subdir.map(|x| x.as_str().into()).unwrap_or_default();
+            let sub_id = TableIdentifier::new(subdir.unwrap_or_default(), data_dir);
+            let sub_name: TableName = sub_id.try_into()?;
 
             let store = glue.storage.expect("No underlying storage??");
-            let tables = store.list_tables(&sub_name)?;
+            let tables = store.list_tables(sub_name)?;
 
             for node in tables {
+                let table_id: TableIdentifier = node.name.try_into()?;
                 match node.data {
-                    TableData::Table(_) => println!("* {} ", node.name),
-                    TableData::Dir => println!("* {}/ (directory)", node.name),
+                    TableData::Table(_) => println!("* {} ", &*table_id),
+                    TableData::Dir => println!("* {}/ (directory)", &*table_id),
                 }
             }
         }

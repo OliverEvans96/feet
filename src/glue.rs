@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use std::fs::{DirEntry, File};
+use std::fs::DirEntry;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
@@ -13,6 +13,7 @@ use gluesql::core::store::{GStore, GStoreMut, RowIter, Store, StoreMut};
 use gluesql::prelude::{DataType, Value};
 
 use crate::config::Config;
+use crate::names::{TableIdentifier, TableName, TablePath};
 
 // use crate::config::Config;
 
@@ -33,77 +34,6 @@ pub struct TableNode {
     pub data: TableData,
 }
 
-/// Hierarchical (e.g. slash-delimited) path/name system
-#[derive(Debug, Default)]
-pub struct TableName(Vec<String>);
-
-impl std::fmt::Display for TableName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0.join("/"))
-    }
-}
-
-impl From<&str> for TableName {
-    fn from(s: &str) -> Self {
-        Self(s.split("/").map(ToString::to_string).collect())
-    }
-}
-
-impl TableName {
-    /// Return the last component of the table name, if any.
-    pub fn last(&self) -> Option<String> {
-        self.0.iter().last().cloned()
-    }
-
-    /// Parse human-readable/writeable (slash-delimited) names
-    pub fn parse(table_name: &str, data_dir: &Path) -> anyhow::Result<Self> {
-        let rel = PathBuf::from(table_name).with_extension("csv");
-        let full = data_dir.join(rel);
-
-        Self::try_from_path(&full, data_dir)
-    }
-
-    pub fn try_from_path(path: &Path, data_dir: &Path) -> anyhow::Result<Self> {
-        let path_can = path
-            .canonicalize()
-            .context(format!("canonicalize path: {:?}", path))?;
-        let root_can = data_dir.canonicalize().context("canonicalize data_dir")?;
-
-        let rel = path_can.strip_prefix(&root_can).context(format!(
-            "path ({:?}) must be in data directory ({:?}).",
-            path_can, root_can
-        ))?;
-
-        let no_ext = rel.with_extension("");
-
-        let parts: Vec<String> = no_ext
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect();
-
-        Ok(Self(parts))
-    }
-
-    /// Convert the name to a path with no extension
-    pub fn to_bare_path(&self, data_dir: &Path) -> PathBuf {
-        // Start from `data_dir`
-        let mut path = data_dir.to_owned();
-
-        // Add each component
-        for part in &self.0 {
-            path.push(part.clone());
-        }
-
-        path
-    }
-
-    /// Convert the name to a path with .csv extension
-    pub fn to_path(&self, data_dir: &Path) -> PathBuf {
-        let path = self.to_bare_path(data_dir);
-        path.with_extension("csv")
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum ColumnType {
     Int,
@@ -121,11 +51,8 @@ impl From<ColumnType> for DataType {
     }
 }
 
-fn get_column_types_for_table(
-    path: &Path,
-    data_dir: &Path,
-) -> anyhow::Result<Vec<(String, ColumnType)>> {
-    let mut reader = csv::Reader::from_path(path)?;
+fn get_column_types_for_table(path: TablePath) -> anyhow::Result<Vec<(String, ColumnType)>> {
+    let mut reader = csv::Reader::from_path(path.as_csv())?;
 
     let headers: Vec<_> = reader.headers()?.iter().map(ToString::to_string).collect();
     let col_types =
@@ -136,13 +63,14 @@ fn get_column_types_for_table(
 }
 
 /// Read the whole file to try to determine a suitable schema
-fn read_schema(path: &Path, data_dir: &Path) -> anyhow::Result<Schema> {
-    let col_pairs = get_column_types_for_table(path, data_dir)?;
+fn read_schema(path: TablePath) -> anyhow::Result<Schema> {
+    let col_pairs =
+        get_column_types_for_table(path.clone()).context("getting column types for schema")?;
 
-    let name = TableName::try_from_path(path, data_dir).context("get table name")?;
+    let table_id: TableIdentifier = path.try_into().context("table id -> path")?;
 
     let mut schema = Schema {
-        table_name: name.to_string(),
+        table_name: table_id.to_string(),
         column_defs: Vec::new(),
         indexes: Vec::new(),
     };
@@ -169,7 +97,7 @@ fn merge_column_types(first: &[ColumnType], second: &[ColumnType]) -> Vec<Column
 /// Determine the minimum column type needed for each column
 /// by brute-force reading every value
 fn determine_column_types(
-    records: StringRecordsIter<File>,
+    records: StringRecordsIter<std::fs::File>,
     ncols: usize,
 ) -> anyhow::Result<Vec<ColumnType>> {
     let init: Vec<ColumnType> = std::iter::repeat(ColumnType::Int).take(ncols).collect();
@@ -209,13 +137,15 @@ impl TableNode {
     fn try_from_dir_entry(entry: DirEntry, data_dir: &Path) -> anyhow::Result<Self> {
         let ftype = entry.metadata()?.file_type();
 
-        let name = TableName::try_from_path(&entry.path(), data_dir)?;
+        let path = TablePath::try_new(entry.path(), data_dir.to_owned())?;
+        let name: TableName = path.clone().try_into()?;
+        // let name = TableName::try_from_path(&entry.path(), data_dir)?;
 
         if ftype.is_dir() {
             let data = TableData::Dir;
             return Ok(TableNode { name, data });
         } else if ftype.is_file() && entry.path().extension() == Some(OsStr::new("csv")) {
-            let schema = read_schema(&name.to_path(data_dir), data_dir)?;
+            let schema = read_schema(path)?;
             let data = TableData::Table(schema);
             return Ok(TableNode { name, data });
         } else {
@@ -241,11 +171,14 @@ impl CsvStore {
             .try_fold(false, |acc, next| next.map(|x| acc || x))
     }
 
-    pub fn list_tables(&self, dir: &TableName) -> anyhow::Result<Vec<TableNode>> {
-        let dir_path = dir.to_bare_path(&self.data_dir);
+    pub fn list_tables(&self, dir: TableName) -> anyhow::Result<Vec<TableNode>> {
+        // println!("list_tables: {:?}", dir);
+        let dir_path: TablePath = dir.try_into()?;
+        // println!("list_tables: {:?}", dir_path.clone().as_dir());
+        // let dir_path = dir.to_bare_path(&self.data_dir);
         let mut tables = Vec::new();
 
-        for entry_res in std::fs::read_dir(dir_path)? {
+        for entry_res in std::fs::read_dir(dir_path.as_dir())? {
             let entry = entry_res?;
 
             if !self.should_ignore(entry.file_name().to_str().expect("funny filename!"))? {
@@ -281,9 +214,13 @@ fn value_from_str(val: &str, typ: ColumnType) -> anyhow::Result<Value> {
 #[async_trait(?Send)]
 impl Store for CsvStore {
     async fn fetch_schema(&self, table_name: &str) -> GlueResult<Option<Schema>> {
-        let name = TableName::from(table_name);
-        let path = name.to_path(&self.data_dir);
-        let schema = read_schema(&path, &self.data_dir)
+        let table_id = TableIdentifier::new(table_name.to_string(), self.data_dir.clone());
+        let path: TablePath = table_id
+            .try_into()
+            .context("convert table id to path")
+            .map_err(|err: anyhow::Error| GlueError::StorageMsg(err.to_string()))?;
+        let schema = read_schema(path)
+            .context("reading schema")
             .map_err(|err| GlueError::StorageMsg(err.to_string()))?;
 
         Ok(Some(schema))
@@ -294,21 +231,27 @@ impl Store for CsvStore {
     }
 
     async fn scan_data(&self, table_name: &str) -> GlueResult<RowIter> {
-        let name = TableName::parse(table_name, &self.data_dir)
-            .map_err(|err| GlueError::StorageMsg(err.to_string()))?;
-        let path = name.to_path(&self.data_dir);
+        let table_id = TableIdentifier::new(table_name.to_string(), self.data_dir.clone());
+        let path: TablePath = table_id
+            .try_into()
+            .context("table id -> path")
+            .map_err(|err: anyhow::Error| GlueError::StorageMsg(err.to_string()))?;
 
-        let col_pairs = get_column_types_for_table(&path, &self.data_dir)
+        let col_pairs = get_column_types_for_table(path.clone())
+            .context("getting column types")
             .map_err(|err| GlueError::StorageMsg(err.to_string()))?;
         let col_types: Vec<_> = col_pairs.into_iter().map(|(_name, typ)| typ).collect();
 
-        let reader =
-            csv::Reader::from_path(path).map_err(|err| GlueError::StorageMsg(err.to_string()))?;
+        let reader = csv::Reader::from_path(path.as_csv())
+            .context("opening csv reader")
+            .map_err(|err| GlueError::StorageMsg(err.to_string()))?;
 
         // Loop over rows
         let records = reader.into_records();
         let unboxed_iter = records.into_iter().enumerate().map(move |(i, res)| {
-            let record = res.map_err(|err| GlueError::StorageMsg(err.to_string()))?;
+            let record = res
+                .context("reading csv record")
+                .map_err(|err| GlueError::StorageMsg(err.to_string()))?;
 
             let key = Key::I32(i.try_into().expect("failed to convert key to i32"));
             // Loop over records in the row
@@ -318,6 +261,7 @@ impl Store for CsvStore {
                 .zip(&col_types)
                 .map(|(s, &typ)| value_from_str(s, typ))
                 .collect::<anyhow::Result<Vec<_>>>()
+                .context("reading csv value")
                 .map_err(|err| GlueError::StorageMsg(err.to_string()))?;
             let row = Row(row_vec);
 
@@ -330,6 +274,15 @@ impl Store for CsvStore {
 
         Ok(iter)
     }
+}
+
+async fn touch(path: &Path) -> std::io::Result<()> {
+    tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(path)
+        .await
+        .map(|_file| ())
 }
 
 #[async_trait(?Send)]
