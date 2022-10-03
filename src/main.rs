@@ -17,6 +17,7 @@ use crate::names::TableName;
 
 mod config;
 mod glue;
+mod line_injector;
 mod names;
 
 use crate::glue::CsvStore;
@@ -70,35 +71,6 @@ fn parse_data_dir(orig: &str) -> anyhow::Result<PathBuf> {
     let can = pb.canonicalize()?;
     Ok(can)
 }
-
-// fn list_tables(config: &Config) -> anyhow::Result<Vec<String>> {
-//     let expanded = shellexpand::tilde(&config.data_dir);
-//     let data_dir = expanded.to_string();
-//     let err_msg = format!("cannot open data_dir: {:?}", &data_dir);
-//     let read_dir = std::fs::read_dir(&data_dir).context(err_msg)?;
-
-//     let mut tables = Vec::new();
-
-//     for res in read_dir {
-//         match res {
-//             Ok(entry) => {
-//                 let path = entry.path();
-//                 let rel = path.strip_prefix(&data_dir)?;
-//                 if let Ok(rel_str) = rel.to_owned().into_os_string().into_string() {
-//                     tables.push(rel_str)
-//                 } else {
-//                     eprintln!("Non-UTF-8 path: {:?}", rel);
-//                 }
-//             }
-//             Err(err) => {
-//                 eprintln!("err 1: {}", err);
-//             }
-//         }
-//     }
-
-//     Ok(tables)
-// }
-
 fn print_payload(payload: Payload) {
     match payload {
         Payload::ShowColumns(cols) => {
@@ -111,8 +83,8 @@ fn print_payload(payload: Payload) {
                 println!("{} ({})", last.0, last.1);
             }
         }
-        Payload::Create => todo!(),
-        Payload::Insert(_) => todo!(),
+        Payload::Create => println!("Created table"),
+        Payload::Insert(n) => println!("Inserted {} rows", n),
         Payload::Select { labels, rows } => {
             let mut table_builder = tabled::builder::Builder::new();
             table_builder.set_columns(labels);
@@ -126,9 +98,9 @@ fn print_payload(payload: Payload) {
 
             println!("{}", table);
         }
-        Payload::Delete(_) => todo!(),
-        Payload::Update(_) => todo!(),
-        Payload::DropTable => todo!(),
+        Payload::Delete(n) => println!("Deleted {} rows", n),
+        Payload::Update(n) => println!("Updated {} rows", n),
+        Payload::DropTable => println!("Dropped table."),
     }
 }
 
@@ -143,12 +115,6 @@ async fn handle_query(glue: &mut Glue<CsvStore>, query: &str) {
 
         print_payload(payload);
     }
-
-    // println!("{} responses: {:#?}", responses.len(), responses);
-
-    // for payload in responses {
-    //     print_payload(payload);
-    // }
 }
 
 fn get_or_create_data_file(filename: &str) -> anyhow::Result<PathBuf> {

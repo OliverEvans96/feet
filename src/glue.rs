@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
-use std::fs::DirEntry;
+use std::fs::{DirEntry, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
@@ -13,6 +14,8 @@ use gluesql::core::store::{GStore, GStoreMut, RowIter, Store, StoreMut};
 use gluesql::prelude::{DataType, Value};
 
 use crate::config::Config;
+use crate::format_value;
+use crate::line_injector::{Injection, LineInjector};
 use crate::names::{TableIdentifier, TableName, TablePath};
 
 // use crate::config::Config;
@@ -64,6 +67,8 @@ fn get_column_types_for_table(path: TablePath) -> anyhow::Result<Vec<(String, Co
 
 /// Read the whole file to try to determine a suitable schema
 fn read_schema(path: TablePath) -> anyhow::Result<Schema> {
+    println!("read_schema: {:?}", &path);
+
     let col_pairs =
         get_column_types_for_table(path.clone()).context("getting column types for schema")?;
 
@@ -211,6 +216,23 @@ fn value_from_str(val: &str, typ: ColumnType) -> anyhow::Result<Value> {
     Ok(res)
 }
 
+fn get_i32_key(key: &Key) -> anyhow::Result<i32> {
+    match *key {
+        Key::I32(x) => Ok(x),
+        _ => bail!("non-i32 key {:?}", key),
+    }
+}
+
+fn get_row_num(key: &Key) -> anyhow::Result<usize> {
+    match get_i32_key(key) {
+        Ok(i) => match i.try_into() {
+            Ok(row_num) => Ok(row_num),
+            Err(_err) => bail!("Invalid row number {}", i),
+        },
+        Err(err) => Err(err),
+    }
+}
+
 #[async_trait(?Send)]
 impl Store for CsvStore {
     async fn fetch_schema(&self, table_name: &str) -> GlueResult<Option<Schema>> {
@@ -218,16 +240,50 @@ impl Store for CsvStore {
         let path: TablePath = table_id
             .try_into()
             .context("convert table id to path")
-            .map_err(|err: anyhow::Error| GlueError::StorageMsg(err.to_string()))?;
-        let schema = read_schema(path)
-            .context("reading schema")
-            .map_err(|err| GlueError::StorageMsg(err.to_string()))?;
+            .to_glue_err()?;
+        if path.clone().as_csv().exists() {
+            let schema = read_schema(path).context("reading schema").to_glue_err()?;
 
-        Ok(Some(schema))
+            Ok(Some(schema))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn fetch_data(&self, table_name: &str, key: &Key) -> GlueResult<Option<Row>> {
-        todo!()
+        println!("fetch_data");
+        dbg!(table_name);
+        dbg!(key);
+
+        // Number of rows to skip
+        let nskip = get_row_num(key).to_glue_err()?;
+
+        let table_id = TableIdentifier::new(table_name.to_string(), self.data_dir.clone());
+        let path: TablePath = table_id
+            .try_into()
+            .context("table id -> path")
+            .to_glue_err()?;
+
+        let col_pairs = get_column_types_for_table(path.clone())
+            .context("getting column types")
+            .to_glue_err()?;
+        let col_types: Vec<_> = col_pairs.into_iter().map(|(_name, typ)| typ).collect();
+
+        let reader = csv::Reader::from_path(path.as_csv())
+            .context("opening csv reader")
+            .to_glue_err()?;
+
+        // Skip first n records
+        let mut records = reader.into_records().skip(nskip);
+
+        records
+            .next()
+            .map(|res| {
+                let record = res.context("reading csv record").to_glue_err()?;
+                let row = read_csv_record(record, col_types.clone())?;
+                Ok(row)
+            })
+            .transpose()
     }
 
     async fn scan_data(&self, table_name: &str) -> GlueResult<RowIter> {
@@ -235,39 +291,24 @@ impl Store for CsvStore {
         let path: TablePath = table_id
             .try_into()
             .context("table id -> path")
-            .map_err(|err: anyhow::Error| GlueError::StorageMsg(err.to_string()))?;
+            .to_glue_err()?;
 
         let col_pairs = get_column_types_for_table(path.clone())
             .context("getting column types")
-            .map_err(|err| GlueError::StorageMsg(err.to_string()))?;
+            .to_glue_err()?;
         let col_types: Vec<_> = col_pairs.into_iter().map(|(_name, typ)| typ).collect();
 
         let reader = csv::Reader::from_path(path.as_csv())
             .context("opening csv reader")
-            .map_err(|err| GlueError::StorageMsg(err.to_string()))?;
+            .to_glue_err()?;
 
         // Loop over rows
         let records = reader.into_records();
         let unboxed_iter = records.into_iter().enumerate().map(move |(i, res)| {
-            let record = res
-                .context("reading csv record")
-                .map_err(|err| GlueError::StorageMsg(err.to_string()))?;
-
             let key = Key::I32(i.try_into().expect("failed to convert key to i32"));
-            // Loop over records in the row
-            let rec_it = record.into_iter();
-
-            let row_vec: Vec<_> = rec_it
-                .zip(&col_types)
-                .map(|(s, &typ)| value_from_str(s, typ))
-                .collect::<anyhow::Result<Vec<_>>>()
-                .context("reading csv value")
-                .map_err(|err| GlueError::StorageMsg(err.to_string()))?;
-            let row = Row(row_vec);
-
-            let pair = (key, row);
-
-            Ok(pair)
+            let record = res.context("reading csv record").to_glue_err()?;
+            let row = read_csv_record(record, col_types.clone())?;
+            Ok((key, row))
         });
 
         let iter: RowIter = Box::new(unboxed_iter);
@@ -276,37 +317,261 @@ impl Store for CsvStore {
     }
 }
 
-async fn touch(path: &Path) -> std::io::Result<()> {
-    tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(path)
-        .await
-        .map(|_file| ())
+fn read_csv_record(record: StringRecord, col_types: Vec<ColumnType>) -> GlueResult<Row> {
+    // Loop over records in the row
+    let rec_it = record.into_iter();
+
+    let row_vec: Vec<_> = rec_it
+        .zip(col_types)
+        .map(|(s, typ)| value_from_str(s, typ))
+        .collect::<anyhow::Result<Vec<_>>>()
+        .context("reading csv value")
+        .to_glue_err()?;
+
+    Ok(Row(row_vec))
+}
+
+trait IntoMutResult<T, U> {
+    fn into_mut_result(self, t: T) -> MutResult<T, U>;
+}
+
+impl<T, U> IntoMutResult<T, U> for Result<U, GlueError> {
+    fn into_mut_result(self, t: T) -> MutResult<T, U> {
+        match self {
+            Ok(val) => Ok((t, val)),
+            Err(err) => Err((t, err)),
+        }
+    }
+}
+
+trait ToGlueError {
+    type Target;
+
+    fn to_glue_err(self) -> GlueResult<Self::Target>;
+}
+
+impl<T> ToGlueError for anyhow::Result<T> {
+    type Target = T;
+
+    fn to_glue_err(self) -> GlueResult<Self::Target> {
+        self.map_err(|err| GlueError::StorageMsg(err.to_string()))
+    }
+}
+
+impl CsvStore {
+    async fn insert_schema(&mut self, schema: &Schema) -> anyhow::Result<()> {
+        let table_id = TableIdentifier::new(schema.table_name.clone(), self.data_dir.clone());
+        let path: TablePath = table_id.try_into()?;
+        let headers = schema.column_defs.iter().map(|col| col.name.clone());
+        let mut writer = csv::Writer::from_path(path.as_csv())?;
+
+        writer.write_record(headers)?;
+
+        Ok(())
+    }
+
+    async fn delete_schema(&mut self, table_name: &str) -> anyhow::Result<()> {
+        println!("delete_data");
+        dbg!(table_name);
+
+        let table_id = TableIdentifier::new(table_name.to_string(), self.data_dir.clone());
+        let path: TablePath = table_id.try_into()?;
+        std::fs::remove_file(path.as_csv())?;
+
+        Ok(())
+    }
+
+    async fn append_data(&mut self, table_name: &str, rows: Vec<Row>) -> anyhow::Result<()> {
+        println!("append_data");
+        dbg!(table_name);
+        dbg!(&rows);
+
+        let table_id = TableIdentifier::new(table_name.to_string(), self.data_dir.clone());
+        let path: TablePath = table_id.try_into()?;
+        let file = OpenOptions::new().append(true).open(path.as_csv())?;
+        let mut writer = csv::WriterBuilder::new().from_writer(file);
+
+        for row in rows {
+            let values = row.0.into_iter().map(format_value);
+            writer.write_record(values)?;
+        }
+
+        Ok(())
+    }
+
+    async fn insert_data(&mut self, table_name: &str, rows: Vec<(Key, Row)>) -> anyhow::Result<()> {
+        println!("insert_data");
+        dbg!(table_name);
+        dbg!(&rows);
+
+        let table_id = TableIdentifier::new(table_name.to_string(), self.data_dir.clone());
+        let path: TablePath = table_id.try_into()?;
+
+        let mut numbered_rows: Vec<_> = rows
+            .into_iter()
+            .map(|(key, row)| get_row_num(&key).map(|row_num| (row_num, row)))
+            .collect::<anyhow::Result<_>>()?;
+
+        // Sort rows
+        numbered_rows.sort_by_key(|(row_num, _row)| *row_num);
+
+        // Extract sorted row_nums & data
+        let mut row_nums = Vec::new();
+        let mut row_data = Vec::new();
+        for (row_num, row) in numbered_rows {
+            row_nums.push(row_num);
+            row_data.push(row);
+        }
+
+        let mut buf = Vec::new();
+
+        {
+            let mut writer = csv::WriterBuilder::new().from_writer(&mut buf);
+
+            // Write rows to temporary buffer
+            for row in row_data {
+                let values = row.0.into_iter().map(format_value);
+                writer.write_record(values)?;
+            }
+        }
+
+        let new_lines = buf.lines();
+        let numbered_lines: Vec<_> = new_lines.enumerate().collect();
+
+        let previous_file = File::open(path.clone().as_csv())?;
+        let previous_reader = BufReader::new(previous_file);
+
+        let previous_lines = previous_reader.lines();
+
+        let injection = Injection::new(numbered_lines);
+        let injector = LineInjector::new(previous_lines, injection);
+
+        // Write combined stream to buffer
+        let mut buf = Vec::new();
+        for line_res in injector {
+            let combined_line = line_res?;
+            writeln!(buf, "{}", combined_line)?;
+        }
+
+        // Overwrite original file with combined buffer
+        let mut combined_file = File::open(path.as_csv())?;
+        combined_file.write_all(&buf)?;
+
+        Ok(())
+    }
+
+    async fn delete_data(&mut self, table_name: &str, keys: Vec<Key>) -> anyhow::Result<()> {
+        println!("delete_data");
+        dbg!(table_name);
+        dbg!(&keys);
+
+        let table_id = TableIdentifier::new(table_name.to_string(), self.data_dir.clone());
+        let path: TablePath = table_id.try_into()?;
+
+        let mut delete_row_nums: Vec<_> = keys
+            .iter()
+            .map(get_row_num)
+            .collect::<anyhow::Result<_>>()?;
+
+        delete_row_nums.sort();
+        delete_row_nums.reverse();
+
+        let mut buf = Vec::new();
+
+        let orig_file = BufReader::new(File::open(path.as_csv())?);
+
+        for (line_num, line_res) in orig_file.lines().enumerate() {
+            let line = line_res?;
+            if let Some(&next_skip_line_num) = delete_row_nums.last() {
+                if next_skip_line_num == line_num {
+                    delete_row_nums.pop();
+                }
+            } else {
+                writeln!(buf, "{}", line)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait(?Send)]
 impl StoreMut for CsvStore {
     async fn insert_schema(self, schema: &Schema) -> MutResult<Self, ()> {
-        todo!()
+        let mut storage = self;
+        CsvStore::insert_schema(&mut storage, schema)
+            .await
+            .to_glue_err()
+            .into_mut_result(storage)
     }
 
     async fn delete_schema(self, table_name: &str) -> MutResult<Self, ()> {
-        todo!()
+        let mut storage = self;
+        CsvStore::delete_schema(&mut storage, table_name)
+            .await
+            .to_glue_err()
+            .into_mut_result(storage)
     }
 
     async fn append_data(self, table_name: &str, rows: Vec<Row>) -> MutResult<Self, ()> {
-        todo!()
+        let mut storage = self;
+        CsvStore::append_data(&mut storage, table_name, rows)
+            .await
+            .to_glue_err()
+            .into_mut_result(storage)
     }
 
     async fn insert_data(self, table_name: &str, rows: Vec<(Key, Row)>) -> MutResult<Self, ()> {
-        todo!()
+        let mut storage = self;
+        CsvStore::insert_data(&mut storage, table_name, rows)
+            .await
+            .to_glue_err()
+            .into_mut_result(storage)
     }
 
     async fn delete_data(self, table_name: &str, keys: Vec<Key>) -> MutResult<Self, ()> {
-        todo!()
+        let mut storage = self;
+        CsvStore::delete_data(&mut storage, table_name, keys)
+            .await
+            .to_glue_err()
+            .into_mut_result(storage)
     }
 }
 
 impl GStore for CsvStore {}
 impl GStoreMut for CsvStore {}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gluesql::test_suite::*;
+
+    use super::*;
+
+    struct CsvTester {
+        storage: Rc<RefCell<Option<CsvStore>>>,
+    }
+
+    impl Tester<CsvStore> for CsvTester {
+        fn new(_: &str) -> Self {
+            let tmpdir = tempdir::TempDir::new("csv-store-tester").expect("tmpdir");
+            let config = Config {
+                data_dir: tmpdir.path().to_str().expect("path conversion").to_owned(),
+                ignores: vec![],
+            };
+            let storage = CsvStore::new(config);
+
+            CsvTester {
+                storage: Rc::new(RefCell::new(Some(storage))),
+            }
+        }
+
+        fn get_cell(&mut self) -> Rc<RefCell<Option<CsvStore>>> {
+            Rc::clone(&self.storage)
+        }
+    }
+
+    generate_store_tests!(tokio::test, CsvTester);
+}
