@@ -1,19 +1,24 @@
+use std::ffi::OsStr;
 use std::fs::{DirEntry, File};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use csv::{StringRecord, StringRecordsIter};
+use globset::Glob;
 use gluesql::core::ast::ColumnDef;
 use gluesql::core::data::{Key, Row, Schema};
 use gluesql::core::result::{Error as GlueError, MutResult, Result as GlueResult};
 use gluesql::core::store::{GStore, GStoreMut, RowIter, Store, StoreMut};
 use gluesql::prelude::{DataType, Value};
 
+use crate::config::Config;
+
 // use crate::config::Config;
 
 pub struct CsvStore {
     data_dir: PathBuf,
+    ignores: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -24,8 +29,8 @@ pub enum TableData {
 
 #[derive(Debug)]
 pub struct TableNode {
-    name: TableName,
-    data: TableData,
+    pub name: TableName,
+    pub data: TableData,
 }
 
 /// Hierarchical (e.g. slash-delimited) path/name system
@@ -45,8 +50,9 @@ impl From<&str> for TableName {
 }
 
 impl TableName {
-    pub fn new() -> Self {
-        Default::default()
+    /// Return the last component of the table name, if any.
+    pub fn last(&self) -> Option<String> {
+        self.0.iter().last().cloned()
     }
 
     /// Parse human-readable/writeable (slash-delimited) names
@@ -78,7 +84,8 @@ impl TableName {
         Ok(Self(parts))
     }
 
-    pub fn to_path(&self, data_dir: &Path) -> PathBuf {
+    /// Convert the name to a path with no extension
+    pub fn to_bare_path(&self, data_dir: &Path) -> PathBuf {
         // Start from `data_dir`
         let mut path = data_dir.to_owned();
 
@@ -87,6 +94,12 @@ impl TableName {
             path.push(part.clone());
         }
 
+        path
+    }
+
+    /// Convert the name to a path with .csv extension
+    pub fn to_path(&self, data_dir: &Path) -> PathBuf {
+        let path = self.to_bare_path(data_dir);
         path.with_extension("csv")
     }
 }
@@ -201,7 +214,7 @@ impl TableNode {
         if ftype.is_dir() {
             let data = TableData::Dir;
             return Ok(TableNode { name, data });
-        } else if ftype.is_file() {
+        } else if ftype.is_file() && entry.path().extension() == Some(OsStr::new("csv")) {
             let schema = read_schema(&name.to_path(data_dir), data_dir)?;
             let data = TableData::Table(schema);
             return Ok(TableNode { name, data });
@@ -212,20 +225,33 @@ impl TableNode {
 }
 
 impl CsvStore {
-    pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir }
+    pub fn new(config: Config) -> Self {
+        let expanded = shellexpand::tilde(&config.data_dir);
+        let data_dir = expanded.to_string().into();
+        Self {
+            data_dir,
+            ignores: config.ignores,
+        }
     }
 
-    pub async fn list_tables(&self, dir: &TableName) -> anyhow::Result<Vec<TableNode>> {
-        println!("list_tables: dir={:?}", dir);
-        let dir_path = dir.to_path(&self.data_dir);
+    pub fn should_ignore(&self, filename: &str) -> anyhow::Result<bool> {
+        self.ignores
+            .iter()
+            .map(|ig| Ok(Glob::new(ig.as_str())?.compile_matcher().is_match(filename)))
+            .try_fold(false, |acc, next| next.map(|x| acc || x))
+    }
+
+    pub fn list_tables(&self, dir: &TableName) -> anyhow::Result<Vec<TableNode>> {
+        let dir_path = dir.to_bare_path(&self.data_dir);
         let mut tables = Vec::new();
 
         for entry_res in std::fs::read_dir(dir_path)? {
             let entry = entry_res?;
 
-            let node = TableNode::try_from_dir_entry(entry, &self.data_dir)?;
-            tables.push(node);
+            if !self.should_ignore(entry.file_name().to_str().expect("funny filename!"))? {
+                let node = TableNode::try_from_dir_entry(entry, &self.data_dir)?;
+                tables.push(node);
+            }
         }
 
         Ok(tables)
