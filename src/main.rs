@@ -190,6 +190,7 @@ async fn main() -> anyhow::Result<()> {
                 match readline {
                     Ok(query) => {
                         repl.add_history_entry(query.as_str());
+                        repl.save_history(&history_file)?;
                         handle_query(&mut glue, &query).await;
                     }
                     Err(ReadlineError::Interrupted) => {
@@ -206,7 +207,6 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            repl.save_history(&history_file)?;
         }
         Command::Query { query } => handle_query(&mut glue, &query).await,
         Command::Tree { subdir } => {

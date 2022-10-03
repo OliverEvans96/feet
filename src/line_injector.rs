@@ -1,5 +1,6 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, fmt::Debug};
 
+#[derive(Debug)]
 pub struct Injection<T> {
     line_nums: VecDeque<usize>,
     lines: VecDeque<T>,
@@ -59,14 +60,15 @@ impl<T> Injection<T> {
 /// Combine two sets of lines into a single text file,
 /// injecting (overwriting) one onto the other at specified
 /// line numbers, padding with spaces if necessary.
+#[derive(Debug)]
 pub struct LineInjector<T, E, I: Iterator<Item = Result<T, E>>> {
     base: I,
-    injection: Injection<Result<T, E>>,
+    injection: Injection<T>,
     line_num: usize,
 }
 
-impl<T: Default, E, I: Iterator<Item = Result<T, E>>> LineInjector<T, E, I> {
-    pub fn new(base: I, injection: Injection<Result<T, E>>) -> Self {
+impl<T: Debug + Default, E: Debug, I: Iterator<Item = Result<T, E>>> LineInjector<T, E, I> {
+    pub fn new(base: I, injection: Injection<T>) -> Self {
         Self {
             base,
             injection,
@@ -83,7 +85,7 @@ impl<T: Default, E, I: Iterator<Item = Result<T, E>>> LineInjector<T, E, I> {
             (None, None) => None,
             (None, Some(next_inject_line_num)) => {
                 if self.line_num == next_inject_line_num {
-                    self.injection.pop_next_line()
+                    Ok(self.injection.pop_next_line()).transpose()
                 } else {
                     Some(Ok(T::default()))
                 }
@@ -91,7 +93,7 @@ impl<T: Default, E, I: Iterator<Item = Result<T, E>>> LineInjector<T, E, I> {
             (Some(base_line), None) => Some(base_line),
             (Some(base_line), Some(next_inject_line_num)) => {
                 if self.line_num == next_inject_line_num {
-                    self.injection.pop_next_line()
+                    Ok(self.injection.pop_next_line()).transpose()
                 } else {
                     Some(base_line)
                 }
@@ -100,7 +102,9 @@ impl<T: Default, E, I: Iterator<Item = Result<T, E>>> LineInjector<T, E, I> {
     }
 }
 
-impl<T: Default, E, I: Iterator<Item = Result<T, E>>> Iterator for LineInjector<T, E, I> {
+impl<T: Default + Debug, E: Debug, I: Iterator<Item = Result<T, E>>> Iterator
+    for LineInjector<T, E, I>
+{
     type Item = Result<T, E>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -143,7 +147,7 @@ mod tests {
 
         let base_iter = base_lines.into_iter().map(Ok);
 
-        let inject_iter = inject_lines.into_iter().map(|(num, line)| (num, Ok(line)));
+        let inject_iter = inject_lines.into_iter();
         let inject_vec: Vec<_> = inject_iter.collect();
 
         let injection = Injection::new(inject_vec);

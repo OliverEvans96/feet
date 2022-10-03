@@ -67,8 +67,6 @@ fn get_column_types_for_table(path: TablePath) -> anyhow::Result<Vec<(String, Co
 
 /// Read the whole file to try to determine a suitable schema
 fn read_schema(path: TablePath) -> anyhow::Result<Schema> {
-    println!("read_schema: {:?}", &path);
-
     let col_pairs =
         get_column_types_for_table(path.clone()).context("getting column types for schema")?;
 
@@ -177,10 +175,7 @@ impl CsvStore {
     }
 
     pub fn list_tables(&self, dir: TableName) -> anyhow::Result<Vec<TableNode>> {
-        // println!("list_tables: {:?}", dir);
         let dir_path: TablePath = dir.try_into()?;
-        // println!("list_tables: {:?}", dir_path.clone().as_dir());
-        // let dir_path = dir.to_bare_path(&self.data_dir);
         let mut tables = Vec::new();
 
         for entry_res in std::fs::read_dir(dir_path.as_dir())? {
@@ -363,7 +358,11 @@ impl CsvStore {
         let table_id = TableIdentifier::new(schema.table_name.clone(), self.data_dir.clone());
         let path: TablePath = table_id.try_into()?;
         let headers = schema.column_defs.iter().map(|col| col.name.clone());
-        let mut writer = csv::Writer::from_path(path.as_csv())?;
+        let csv_path = path.as_csv();
+        if let Some(parent) = csv_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut writer = csv::Writer::from_path(csv_path)?;
 
         writer.write_record(headers)?;
 
@@ -419,10 +418,12 @@ impl CsvStore {
         let mut row_nums = Vec::new();
         let mut row_data = Vec::new();
         for (row_num, row) in numbered_rows {
-            row_nums.push(row_num);
+            // Add one to line numbers to account for headers
+            row_nums.push(row_num + 1);
             row_data.push(row);
         }
 
+        // Write new CSV rows to temporary buffer
         let mut buf = Vec::new();
 
         {
@@ -436,7 +437,10 @@ impl CsvStore {
         }
 
         let new_lines = buf.lines();
-        let numbered_lines: Vec<_> = new_lines.enumerate().collect();
+        let numbered_lines: Vec<_> = new_lines
+            .zip(row_nums)
+            .map(|(line, row_num)| line.map(|l| (row_num, l)))
+            .collect::<std::io::Result<_>>()?;
 
         let previous_file = File::open(path.clone().as_csv())?;
         let previous_reader = BufReader::new(previous_file);
@@ -454,7 +458,7 @@ impl CsvStore {
         }
 
         // Overwrite original file with combined buffer
-        let mut combined_file = File::open(path.as_csv())?;
+        let mut combined_file = File::create(path.as_csv())?;
         combined_file.write_all(&buf)?;
 
         Ok(())
