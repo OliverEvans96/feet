@@ -1,8 +1,6 @@
-use std::{
-    path::{Path, PathBuf},
-    str::FromStr,
-};
+use std::path::{Path, PathBuf};
 
+use anyhow::bail;
 use clap::{Parser, Subcommand};
 use error::Sendify;
 use gluesql::prelude::{Glue, Payload, Value};
@@ -66,13 +64,6 @@ fn get_config<P: AsRef<Path>>(path: Option<P>) -> anyhow::Result<Config> {
     Ok(parsed_config)
 }
 
-/// Expand and canonicalize path
-fn parse_data_dir(orig: &str) -> anyhow::Result<PathBuf> {
-    let s = shellexpand::tilde(orig);
-    let pb = PathBuf::from_str(&s)?;
-    let can = pb.canonicalize()?;
-    Ok(can)
-}
 fn print_payload(payload: Payload) {
     match payload {
         Payload::ShowColumns(cols) => {
@@ -113,6 +104,36 @@ async fn handle_query(glue: &mut Glue<CsvStore>, query: &str) -> anyhow::Result<
         let payload = glue.execute_stmt_async(&statement).await.sendify()??;
 
         print_payload(payload);
+    }
+
+    Ok(())
+}
+
+/// Special commands, starting with `.` at the repl
+fn handle_command(glue: &mut Glue<CsvStore>, command: &str) -> anyhow::Result<()> {
+    let store = glue.storage.as_ref().expect("no underlying storage??");
+    let words: Vec<_> = command.split_whitespace().collect();
+    if let Some((first, rest)) = words.split_first() {
+        match *first {
+            "tree" => {
+                let subdir = rest.first().map(|&s| s);
+                print_tree(subdir, store)?;
+            }
+            "list" => {
+                let subdir = rest.first().map(|&s| s);
+                print_list(subdir, store)?;
+            }
+            "help" => {
+                // TODO: Automate this
+                println!("Current options:");
+                println!("* .help");
+                println!("* .tree <subdir>");
+                println!("* .list <subdir>");
+            }
+            other => bail!("Unrecognized command {:?}", other),
+        };
+    } else {
+        bail!("No command following `.`");
     }
 
     Ok(())
@@ -166,6 +187,40 @@ fn build_table_tree(store: &CsvStore, sub_name: TableName) -> anyhow::Result<Str
     Ok(tree.build())
 }
 
+fn print_tree(subdir: Option<&str>, store: &CsvStore) -> anyhow::Result<()> {
+    let sub_id = TableIdentifier::new(
+        subdir.unwrap_or_default().to_owned(),
+        store.data_dir.clone(),
+    );
+    let sub_name: TableName = sub_id.try_into()?;
+
+    let tree = build_table_tree(&store, sub_name)?;
+
+    ptree::print_tree(&tree)?;
+
+    Ok(())
+}
+
+fn print_list(subdir: Option<&str>, store: &CsvStore) -> anyhow::Result<()> {
+    let sub_id = TableIdentifier::new(
+        subdir.unwrap_or_default().to_owned(),
+        store.data_dir.clone(),
+    );
+    let sub_name: TableName = sub_id.try_into()?;
+
+    let tables = store.list_tables(sub_name)?;
+
+    for node in tables {
+        let table_id: TableIdentifier = node.name.try_into()?;
+        match node.data {
+            TableData::Table(_) => println!("* {} ", &*table_id),
+            TableData::Dir => println!("* {}/ (directory)", &*table_id),
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let opts = Opts::parse();
@@ -173,10 +228,9 @@ async fn main() -> anyhow::Result<()> {
     let config = get_config(opts.config.as_ref())?;
 
     // TODO: Parse during Opts::parse
-    let data_dir = parse_data_dir(&config.data_dir)?;
     let history_file = get_or_create_data_file("history.txt")?;
 
-    let store = CsvStore::new(config);
+    let store = CsvStore::try_new(config)?;
     let mut glue = Glue::new(store);
 
     match opts.command {
@@ -189,11 +243,18 @@ async fn main() -> anyhow::Result<()> {
                 let readline = repl.readline("> ");
 
                 match readline {
-                    Ok(query) => {
-                        repl.add_history_entry(query.as_str());
+                    Ok(line) => {
+                        repl.add_history_entry(line.as_str());
                         repl.save_history(&history_file)?;
-                        if let Err(err) = handle_query(&mut glue, &query).await {
-                            eprintln!("{:#}", err);
+
+                        if let Some(command) = line.strip_prefix('.') {
+                            if let Err(err) = handle_command(&mut glue, &command) {
+                                eprintln!("{:#}", err);
+                            }
+                        } else {
+                            if let Err(err) = handle_query(&mut glue, &line).await {
+                                eprintln!("{:#}", err);
+                            }
                         }
                     }
                     // Err(ReadlineError::Interrupted) => {
@@ -214,29 +275,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Query { query } => handle_query(&mut glue, &query).await?,
         Command::Tree { subdir } => {
-            let sub_id = TableIdentifier::new(subdir.unwrap_or_default(), data_dir);
-            let sub_name: TableName = sub_id.try_into()?;
-
             let store = glue.storage.expect("No underlying storage??");
-
-            let tree = build_table_tree(&store, sub_name)?;
-
-            ptree::print_tree(&tree)?;
+            print_tree(subdir.as_deref(), &store)?;
         }
         Command::List { subdir } => {
-            let sub_id = TableIdentifier::new(subdir.unwrap_or_default(), data_dir);
-            let sub_name: TableName = sub_id.try_into()?;
-
             let store = glue.storage.expect("No underlying storage??");
-            let tables = store.list_tables(sub_name)?;
-
-            for node in tables {
-                let table_id: TableIdentifier = node.name.try_into()?;
-                match node.data {
-                    TableData::Table(_) => println!("* {} ", &*table_id),
-                    TableData::Dir => println!("* {}/ (directory)", &*table_id),
-                }
-            }
+            print_list(subdir.as_deref(), &store)?;
         }
     }
 

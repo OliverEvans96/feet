@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::fs::{DirEntry, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
@@ -21,7 +22,7 @@ use crate::names::{TableIdentifier, TableName, TablePath};
 // use crate::config::Config;
 
 pub struct CsvStore {
-    data_dir: PathBuf,
+    pub data_dir: PathBuf,
     ignores: Vec<String>,
 }
 
@@ -157,14 +158,23 @@ impl TableNode {
     }
 }
 
+/// Expand and canonicalize path
+fn parse_data_dir(orig: &str) -> anyhow::Result<PathBuf> {
+    let s = shellexpand::tilde(orig);
+    let pb = PathBuf::from_str(&s)?;
+    let can = pb.canonicalize()?;
+    Ok(can)
+}
+
 impl CsvStore {
-    pub fn new(config: Config) -> Self {
-        let expanded = shellexpand::tilde(&config.data_dir);
-        let data_dir = expanded.to_string().into();
-        Self {
+    pub fn try_new(config: Config) -> anyhow::Result<Self> {
+        let data_dir = parse_data_dir(&config.data_dir)?;
+        let new = Self {
             data_dir,
             ignores: config.ignores,
-        }
+        };
+
+        Ok(new)
     }
 
     pub fn should_ignore(&self, filename: &str) -> anyhow::Result<bool> {
@@ -190,16 +200,6 @@ impl CsvStore {
         Ok(tables)
     }
 }
-
-// struct CsvRowIter {}
-
-// impl Iterator<Item=GlueResult<(Key, Row)>> for CsvRowIter {
-//     type Item;
-
-//     fn next(&mut self) -> Option<Self::Item> {
-//         todo!()
-//     }
-// }
 
 fn value_from_str(val: &str, typ: ColumnType) -> anyhow::Result<Value> {
     let res = match typ {
