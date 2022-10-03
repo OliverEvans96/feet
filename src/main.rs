@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use gluesql::prelude::Glue;
+use gluesql::prelude::{execute, parse, translate, Glue, Value};
 
 use crate::config::Config;
 use crate::glue::{TableName, TableNode};
@@ -57,10 +57,7 @@ fn get_config<P: AsRef<Path>>(path: Option<P>) -> anyhow::Result<Config> {
 fn parse_data_dir(orig: &str) -> anyhow::Result<PathBuf> {
     let s = shellexpand::tilde(orig);
     let pb = PathBuf::from_str(&s)?;
-    println!("AA");
     let can = pb.canonicalize()?;
-
-    println!("BB");
     Ok(can)
 }
 
@@ -95,26 +92,54 @@ fn list_tables(config: &Config) -> anyhow::Result<Vec<String>> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    println!("Hello, world!");
-
     let opts = Opts::parse();
 
     let config = get_config(opts.config.as_ref())?;
 
-    dbg!(&opts);
-    dbg!(&config);
-
     // TODO: Parse during Opts::parse
     let data_dir = parse_data_dir(&config.data_dir)?;
 
-    println!("parsed data dir");
-
     let store = crate::glue::CsvStore::new(data_dir.clone());
 
-    println!("created store");
-
     match opts.command {
-        Command::Query { query } => todo!(),
+        Command::Query { query } => {
+            let mut glue = Glue::new(store);
+
+            let responses = glue.execute(query).expect("oops - glue");
+
+            for payload in responses {
+                match payload {
+                    gluesql::prelude::Payload::ShowColumns(cols) => {
+                        print!("SHOW COLUMNS: ");
+                        if let Some((last, most)) = cols.split_last() {
+                            for col in most {
+                                print!("{} ({}), ", col.0, col.1);
+                            }
+
+                            println!("{} ({})", last.0, last.1);
+                        }
+                    }
+                    gluesql::prelude::Payload::Create => todo!(),
+                    gluesql::prelude::Payload::Insert(_) => todo!(),
+                    gluesql::prelude::Payload::Select { labels, rows } => {
+                        let mut table_builder = tabled::builder::Builder::new();
+                        table_builder.set_columns(labels);
+                        for row in rows {
+                            table_builder.add_record(row.into_iter().map(format_value));
+                        }
+
+                        let mut table = table_builder.build();
+
+                        table.with(tabled::style::Style::modern());
+
+                        println!("{}", table);
+                    }
+                    gluesql::prelude::Payload::Delete(_) => todo!(),
+                    gluesql::prelude::Payload::Update(_) => todo!(),
+                    gluesql::prelude::Payload::DropTable => todo!(),
+                }
+            }
+        }
         Command::List { subdir } => {
             let sub_name: TableName = subdir.map(|x| x.as_str().into()).unwrap_or_default();
 
@@ -138,4 +163,27 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn format_value(value: Value) -> String {
+    match value {
+        Value::Str(s) => s,
+        Value::Bool(_) => todo!(),
+        Value::I8(_) => todo!(),
+        Value::I16(_) => todo!(),
+        Value::I32(_) => todo!(),
+        Value::I64(_) => todo!(),
+        Value::I128(_) => todo!(),
+        Value::F64(_) => todo!(),
+        Value::Decimal(_) => todo!(),
+        Value::Bytea(_) => todo!(),
+        Value::Date(_) => todo!(),
+        Value::Timestamp(_) => todo!(),
+        Value::Time(_) => todo!(),
+        Value::Interval(_) => todo!(),
+        Value::Uuid(_) => todo!(),
+        Value::Map(_) => todo!(),
+        Value::List(_) => todo!(),
+        Value::Null => todo!(),
+    }
 }

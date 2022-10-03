@@ -5,12 +5,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use csv::{StringRecord, StringRecordIter, StringRecordsIter};
-use gluesql::core::ast::ColumnDef;
+use gluesql::core::ast::{ColumnDef, IndexOperator, OrderByExpr};
 use gluesql::core::data::{Key, Row, Schema};
-use gluesql::core::store::{RowIter, Store};
-
-use gluesql::core::result::Result as GlueResult;
-use gluesql::prelude::DataType;
+use gluesql::core::result::{Error as GlueError, MutResult, Result as GlueResult};
+use gluesql::core::store::{GStore, GStoreMut, RowIter, Store, StoreMut};
+use gluesql::prelude::{DataType, Value};
 
 use crate::config::Config;
 
@@ -51,6 +50,14 @@ impl TableName {
         Default::default()
     }
 
+    /// Parse human-readable/writeable (slash-delimited) names
+    pub fn parse(table_name: &str, data_dir: &Path) -> anyhow::Result<Self> {
+        let rel = PathBuf::from(table_name).with_extension("csv");
+        let full = data_dir.join(rel);
+
+        Self::try_from_path(&full, data_dir)
+    }
+
     pub fn try_from_path(path: &Path, data_dir: &Path) -> anyhow::Result<Self> {
         let path_can = path
             .canonicalize()
@@ -81,7 +88,7 @@ impl TableName {
             path.push(part.clone());
         }
 
-        path
+        path.with_extension("csv")
     }
 }
 
@@ -106,9 +113,7 @@ impl From<ColumnType> for DataType {
 fn read_schema(path: &Path, data_dir: &Path) -> anyhow::Result<Schema> {
     let mut reader = csv::Reader::from_path(path)?;
 
-    let name = TableName::try_from_path(path, data_dir)?;
-
-    println!("read_schema: {}", name);
+    let name = TableName::try_from_path(path, data_dir).context("get table name")?;
 
     let mut schema = Schema {
         table_name: name.to_string(),
@@ -117,7 +122,8 @@ fn read_schema(path: &Path, data_dir: &Path) -> anyhow::Result<Schema> {
     };
 
     let headers: Vec<String> = reader.headers()?.iter().map(ToString::to_string).collect();
-    let col_types = determine_column_types(reader.records(), headers.len())?;
+    let col_types =
+        determine_column_types(reader.records(), headers.len()).context("get col_types")?;
 
     for (col_name, col_type) in headers.into_iter().zip(col_types) {
         let col_def = ColumnDef {
@@ -187,7 +193,7 @@ impl TableNode {
             let data = TableData::Dir;
             return Ok(TableNode { name, data });
         } else if ftype.is_file() {
-            let schema = read_schema(&entry.path(), data_dir)?;
+            let schema = read_schema(&name.to_path(data_dir), data_dir)?;
             let data = TableData::Table(schema);
             return Ok(TableNode { name, data });
         } else {
@@ -221,10 +227,25 @@ impl CsvStore {
     }
 }
 
+// struct CsvRowIter {}
+
+// impl Iterator<Item=GlueResult<(Key, Row)>> for CsvRowIter {
+//     type Item;
+
+//     fn next(&mut self) -> Option<Self::Item> {
+//         todo!()
+//     }
+// }
+
 #[async_trait(?Send)]
 impl Store for CsvStore {
     async fn fetch_schema(&self, table_name: &str) -> GlueResult<Option<Schema>> {
-        todo!()
+        let name = TableName::from(table_name);
+        let path = name.to_path(&self.data_dir);
+        let schema = read_schema(&path, &self.data_dir)
+            .map_err(|err| GlueError::StorageMsg(err.to_string()))?;
+
+        Ok(Some(schema))
     }
 
     async fn fetch_data(&self, table_name: &str, key: &Key) -> GlueResult<Option<Row>> {
@@ -232,6 +253,57 @@ impl Store for CsvStore {
     }
 
     async fn scan_data(&self, table_name: &str) -> GlueResult<RowIter> {
+        let name = TableName::parse(table_name, &self.data_dir)
+            .map_err(|err| GlueError::StorageMsg(err.to_string()))?;
+        let path = name.to_path(&self.data_dir);
+
+        let reader =
+            csv::Reader::from_path(path).map_err(|err| GlueError::StorageMsg(err.to_string()))?;
+
+        // Loop over rows
+        let records = reader.into_records();
+        let unboxed_iter = records.into_iter().enumerate().map(move |(i, res)| {
+            let record = res.map_err(|err| GlueError::StorageMsg(err.to_string()))?;
+
+            let key = Key::I32(i.try_into().expect("failed to convert key to i32"));
+            // Loop over records in the row
+            let rec_it = record.into_iter();
+            let row_vec = rec_it.map(|s| Value::Str(s.to_owned())).collect();
+            let row = Row(row_vec);
+
+            let pair = (key, row);
+
+            Ok(pair)
+        });
+
+        let iter: RowIter = Box::new(unboxed_iter);
+
+        Ok(iter)
+    }
+}
+
+#[async_trait(?Send)]
+impl StoreMut for CsvStore {
+    async fn insert_schema(self, schema: &Schema) -> MutResult<Self, ()> {
+        todo!()
+    }
+
+    async fn delete_schema(self, table_name: &str) -> MutResult<Self, ()> {
+        todo!()
+    }
+
+    async fn append_data(self, table_name: &str, rows: Vec<Row>) -> MutResult<Self, ()> {
+        todo!()
+    }
+
+    async fn insert_data(self, table_name: &str, rows: Vec<(Key, Row)>) -> MutResult<Self, ()> {
+        todo!()
+    }
+
+    async fn delete_data(self, table_name: &str, keys: Vec<Key>) -> MutResult<Self, ()> {
         todo!()
     }
 }
+
+impl GStore for CsvStore {}
+impl GStoreMut for CsvStore {}
