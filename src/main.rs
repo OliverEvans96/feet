@@ -231,15 +231,15 @@ async fn main() -> anyhow::Result<()> {
 fn format_value(value: Value) -> String {
     match value {
         Value::Str(s) => s,
-        Value::Bool(_) => todo!(),
-        Value::I8(_) => todo!(),
-        Value::I16(_) => todo!(),
-        Value::I32(_) => todo!(),
-        Value::I64(_) => todo!(),
-        Value::I128(_) => todo!(),
-        Value::F64(_) => todo!(),
-        Value::Decimal(_) => todo!(),
-        Value::Bytea(_) => todo!(),
+        Value::Bool(x) => format!("{}", x),
+        Value::I8(x) => format!("{}", x),
+        Value::I16(x) => format!("{}", x),
+        Value::I32(x) => format!("{}", x),
+        Value::I64(x) => format!("{}", x),
+        Value::I128(x) => format!("{}", x),
+        Value::F64(x) => format!("{}", x),
+        Value::Decimal(x) => format!("{}", x),
+        Value::Bytea(x) => format!("{:?}", x),
         Value::Date(_) => todo!(),
         Value::Timestamp(_) => todo!(),
         Value::Time(_) => todo!(),
@@ -247,6 +247,6 @@ fn format_value(value: Value) -> String {
         Value::Uuid(_) => todo!(),
         Value::Map(_) => todo!(),
         Value::List(_) => todo!(),
-        Value::Null => todo!(),
+        Value::Null => "NULL".to_string(),
     }
 }

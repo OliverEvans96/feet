@@ -108,9 +108,23 @@ impl From<ColumnType> for DataType {
     }
 }
 
+fn get_column_types_for_table(
+    path: &Path,
+    data_dir: &Path,
+) -> anyhow::Result<Vec<(String, ColumnType)>> {
+    let mut reader = csv::Reader::from_path(path)?;
+
+    let headers: Vec<_> = reader.headers()?.iter().map(ToString::to_string).collect();
+    let col_types =
+        determine_column_types(reader.records(), headers.len()).context("get col_types")?;
+
+    let pairs = headers.into_iter().zip(col_types).collect();
+    Ok(pairs)
+}
+
 /// Read the whole file to try to determine a suitable schema
 fn read_schema(path: &Path, data_dir: &Path) -> anyhow::Result<Schema> {
-    let mut reader = csv::Reader::from_path(path)?;
+    let col_pairs = get_column_types_for_table(path, data_dir)?;
 
     let name = TableName::try_from_path(path, data_dir).context("get table name")?;
 
@@ -120,11 +134,7 @@ fn read_schema(path: &Path, data_dir: &Path) -> anyhow::Result<Schema> {
         indexes: Vec::new(),
     };
 
-    let headers: Vec<String> = reader.headers()?.iter().map(ToString::to_string).collect();
-    let col_types =
-        determine_column_types(reader.records(), headers.len()).context("get col_types")?;
-
-    for (col_name, col_type) in headers.into_iter().zip(col_types) {
+    for (col_name, col_type) in col_pairs {
         let col_def = ColumnDef {
             name: col_name,
             data_type: col_type.into(),
@@ -220,10 +230,6 @@ impl CsvStore {
 
         Ok(tables)
     }
-
-    async fn read_table(&self, table_name: &str) -> Schema {
-        todo!()
-    }
 }
 
 // struct CsvRowIter {}
@@ -235,6 +241,16 @@ impl CsvStore {
 //         todo!()
 //     }
 // }
+
+fn value_from_str(val: &str, typ: ColumnType) -> anyhow::Result<Value> {
+    let res = match typ {
+        ColumnType::Int => Value::I32(val.parse()?),
+        ColumnType::Float => Value::F64(val.parse()?),
+        ColumnType::String => Value::Str(val.to_owned()),
+    };
+
+    Ok(res)
+}
 
 #[async_trait(?Send)]
 impl Store for CsvStore {
@@ -256,6 +272,10 @@ impl Store for CsvStore {
             .map_err(|err| GlueError::StorageMsg(err.to_string()))?;
         let path = name.to_path(&self.data_dir);
 
+        let col_pairs = get_column_types_for_table(&path, &self.data_dir)
+            .map_err(|err| GlueError::StorageMsg(err.to_string()))?;
+        let col_types: Vec<_> = col_pairs.into_iter().map(|(_name, typ)| typ).collect();
+
         let reader =
             csv::Reader::from_path(path).map_err(|err| GlueError::StorageMsg(err.to_string()))?;
 
@@ -267,7 +287,12 @@ impl Store for CsvStore {
             let key = Key::I32(i.try_into().expect("failed to convert key to i32"));
             // Loop over records in the row
             let rec_it = record.into_iter();
-            let row_vec = rec_it.map(|s| Value::Str(s.to_owned())).collect();
+
+            let row_vec: Vec<_> = rec_it
+                .zip(&col_types)
+                .map(|(s, &typ)| value_from_str(s, typ))
+                .collect::<anyhow::Result<Vec<_>>>()
+                .map_err(|err| GlueError::StorageMsg(err.to_string()))?;
             let row = Row(row_vec);
 
             let pair = (key, row);
