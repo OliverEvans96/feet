@@ -220,8 +220,9 @@ fn get_i32_key(key: &Key) -> anyhow::Result<i32> {
 
 fn get_row_num(key: &Key) -> anyhow::Result<usize> {
     match get_i32_key(key) {
-        Ok(i) => match i.try_into() {
-            Ok(row_num) => Ok(row_num),
+        Ok(i) => match usize::try_from(i) {
+            // Add one to account for headers
+            Ok(row_num) => Ok(row_num + 1),
             Err(_err) => bail!("Invalid row number {}", i),
         },
         Err(err) => Err(err),
@@ -418,8 +419,7 @@ impl CsvStore {
         let mut row_nums = Vec::new();
         let mut row_data = Vec::new();
         for (row_num, row) in numbered_rows {
-            // Add one to line numbers to account for headers
-            row_nums.push(row_num + 1);
+            row_nums.push(row_num);
             row_data.push(row);
         }
 
@@ -471,6 +471,7 @@ impl CsvStore {
 
         let table_id = TableIdentifier::new(table_name.to_string(), self.data_dir.clone());
         let path: TablePath = table_id.try_into()?;
+        let csv_path = path.as_csv();
 
         let mut delete_row_nums: Vec<_> = keys
             .iter()
@@ -482,18 +483,21 @@ impl CsvStore {
 
         let mut buf = Vec::new();
 
-        let orig_file = BufReader::new(File::open(path.as_csv())?);
+        let orig_file = BufReader::new(File::open(&csv_path)?);
 
         for (line_num, line_res) in orig_file.lines().enumerate() {
             let line = line_res?;
             if let Some(&next_skip_line_num) = delete_row_nums.last() {
                 if next_skip_line_num == line_num {
                     delete_row_nums.pop();
+                    continue;
                 }
-            } else {
-                writeln!(buf, "{}", line)?;
             }
+            writeln!(buf, "{}", line)?;
         }
+
+        let mut file = File::create(&csv_path)?;
+        file.write_all(&buf)?;
 
         Ok(())
     }
