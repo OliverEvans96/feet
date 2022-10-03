@@ -1,17 +1,16 @@
-use std::collections::HashMap;
-use std::fs::{DirEntry, File, FileType};
+use std::fs::{DirEntry, File};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
-use csv::{StringRecord, StringRecordIter, StringRecordsIter};
-use gluesql::core::ast::{ColumnDef, IndexOperator, OrderByExpr};
+use csv::{StringRecord, StringRecordsIter};
+use gluesql::core::ast::ColumnDef;
 use gluesql::core::data::{Key, Row, Schema};
 use gluesql::core::result::{Error as GlueError, MutResult, Result as GlueResult};
 use gluesql::core::store::{GStore, GStoreMut, RowIter, Store, StoreMut};
 use gluesql::prelude::{DataType, Value};
 
-use crate::config::Config;
+// use crate::config::Config;
 
 pub struct CsvStore {
     data_dir: PathBuf,

@@ -5,13 +5,18 @@ use std::{
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use gluesql::prelude::{execute, parse, translate, Glue, Value};
+use gluesql::prelude::{Glue, Payload, Value};
+use rustyline::error::ReadlineError;
+
+// use gluesql::core::store::{GStore, GStoreMut};
 
 use crate::config::Config;
-use crate::glue::{TableName, TableNode};
+use crate::glue::TableName;
 
 mod config;
 mod glue;
+
+use crate::glue::CsvStore;
 
 #[derive(Debug, Parser)]
 struct Opts {
@@ -30,6 +35,8 @@ enum Command {
     List { subdir: Option<String> },
     /// Show schema for a table
     Show { table_name: String },
+    /// SQL repl
+    Repl,
 }
 
 fn get_xdg_dirs() -> anyhow::Result<xdg::BaseDirectories> {
@@ -90,6 +97,67 @@ fn list_tables(config: &Config) -> anyhow::Result<Vec<String>> {
     Ok(tables)
 }
 
+fn print_payload(payload: Payload) {
+    match payload {
+        Payload::ShowColumns(cols) => {
+            print!("SHOW COLUMNS: ");
+            if let Some((last, most)) = cols.split_last() {
+                for col in most {
+                    print!("{} ({}), ", col.0, col.1);
+                }
+
+                println!("{} ({})", last.0, last.1);
+            }
+        }
+        Payload::Create => todo!(),
+        Payload::Insert(_) => todo!(),
+        Payload::Select { labels, rows } => {
+            let mut table_builder = tabled::builder::Builder::new();
+            table_builder.set_columns(labels);
+            for row in rows {
+                table_builder.add_record(row.into_iter().map(format_value));
+            }
+
+            let mut table = table_builder.build();
+
+            table.with(tabled::style::Style::modern());
+
+            println!("{}", table);
+        }
+        Payload::Delete(_) => todo!(),
+        Payload::Update(_) => todo!(),
+        Payload::DropTable => todo!(),
+    }
+}
+
+async fn handle_query(glue: &mut Glue<CsvStore>, query: &str) {
+    let statements = glue.plan(query).await.expect("planning");
+
+    for statement in statements {
+        let payload = glue
+            .execute_stmt_async(&statement)
+            .await
+            .expect("oops - glue");
+
+        print_payload(payload);
+    }
+
+    // println!("{} responses: {:#?}", responses.len(), responses);
+
+    // for payload in responses {
+    //     print_payload(payload);
+    // }
+}
+
+fn get_or_create_data_file(filename: &str) -> anyhow::Result<PathBuf> {
+    let xdg_dirs = get_xdg_dirs()?;
+    xdg_dirs
+        .find_data_file(filename)
+        .map(Ok)
+        .unwrap_or_else(|| xdg_dirs.place_data_file(filename))
+        .map_err(Into::into)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let opts = Opts::parse();
@@ -98,48 +166,42 @@ async fn main() -> anyhow::Result<()> {
 
     // TODO: Parse during Opts::parse
     let data_dir = parse_data_dir(&config.data_dir)?;
+    let history_file = get_or_create_data_file("history.txt")?;
 
-    let store = crate::glue::CsvStore::new(data_dir.clone());
+    let store = CsvStore::new(data_dir.clone());
+    let mut glue = Glue::new(store);
 
     match opts.command {
-        Command::Query { query } => {
-            let mut glue = Glue::new(store);
+        Command::Repl => {
+            let mut repl = rustyline::Editor::<()>::new()?;
+            if repl.load_history(&history_file).is_err() {
+                println!("No previous history.");
+            }
+            loop {
+                let readline = repl.readline("> ");
 
-            let responses = glue.execute(query).expect("oops - glue");
-
-            for payload in responses {
-                match payload {
-                    gluesql::prelude::Payload::ShowColumns(cols) => {
-                        print!("SHOW COLUMNS: ");
-                        if let Some((last, most)) = cols.split_last() {
-                            for col in most {
-                                print!("{} ({}), ", col.0, col.1);
-                            }
-
-                            println!("{} ({})", last.0, last.1);
-                        }
+                match readline {
+                    Ok(query) => {
+                        repl.add_history_entry(query.as_str());
+                        handle_query(&mut glue, &query).await;
                     }
-                    gluesql::prelude::Payload::Create => todo!(),
-                    gluesql::prelude::Payload::Insert(_) => todo!(),
-                    gluesql::prelude::Payload::Select { labels, rows } => {
-                        let mut table_builder = tabled::builder::Builder::new();
-                        table_builder.set_columns(labels);
-                        for row in rows {
-                            table_builder.add_record(row.into_iter().map(format_value));
-                        }
-
-                        let mut table = table_builder.build();
-
-                        table.with(tabled::style::Style::modern());
-
-                        println!("{}", table);
+                    Err(ReadlineError::Interrupted) => {
+                        println!("CTRL-C");
+                        break;
                     }
-                    gluesql::prelude::Payload::Delete(_) => todo!(),
-                    gluesql::prelude::Payload::Update(_) => todo!(),
-                    gluesql::prelude::Payload::DropTable => todo!(),
+                    Err(ReadlineError::Eof) => {
+                        println!("CTRL-D");
+                        break;
+                    }
+                    Err(err) => {
+                        println!("Error: {:?}", err);
+                        break;
+                    }
                 }
             }
+            repl.save_history(&history_file)?;
         }
+        Command::Query { query } => handle_query(&mut glue, &query).await,
         Command::List { subdir } => {
             let sub_name: TableName = subdir.map(|x| x.as_str().into()).unwrap_or_default();
 
@@ -151,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
             //     sub_name = TableName::new();
             // }
 
+            let store = glue.storage.expect("No underlying storage??");
             let tables = store.list_tables(&sub_name).await?;
 
             println!("tables: {:#?}", tables);
