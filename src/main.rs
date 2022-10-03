@@ -4,6 +4,7 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
+use error::Sendify;
 use gluesql::prelude::{Glue, Payload, Value};
 use names::TableIdentifier;
 use ptree::{item::StringItem, TreeBuilder};
@@ -16,6 +17,7 @@ use crate::glue::{TableData, TableNode};
 use crate::names::TableName;
 
 mod config;
+mod error;
 mod glue;
 mod line_injector;
 mod names;
@@ -104,17 +106,16 @@ fn print_payload(payload: Payload) {
     }
 }
 
-async fn handle_query(glue: &mut Glue<CsvStore>, query: &str) {
-    let statements = glue.plan(query).await.expect("planning");
+async fn handle_query(glue: &mut Glue<CsvStore>, query: &str) -> anyhow::Result<()> {
+    let statements = glue.plan(query).await.sendify()??;
 
     for statement in statements {
-        let payload = glue
-            .execute_stmt_async(&statement)
-            .await
-            .expect("oops - glue");
+        let payload = glue.execute_stmt_async(&statement).await.sendify()??;
 
         print_payload(payload);
     }
+
+    Ok(())
 }
 
 fn get_or_create_data_file(filename: &str) -> anyhow::Result<PathBuf> {
@@ -191,24 +192,27 @@ async fn main() -> anyhow::Result<()> {
                     Ok(query) => {
                         repl.add_history_entry(query.as_str());
                         repl.save_history(&history_file)?;
-                        handle_query(&mut glue, &query).await;
+                        if let Err(err) = handle_query(&mut glue, &query).await {
+                            eprintln!("{:#}", err);
+                        }
                     }
-                    Err(ReadlineError::Interrupted) => {
-                        println!("CTRL-C");
-                        break;
-                    }
+                    // Err(ReadlineError::Interrupted) => {
+                    //     eprintln!("CTRL-C");
+                    //     break;
+                    // }
                     Err(ReadlineError::Eof) => {
-                        println!("CTRL-D");
+                        eprintln!("CTRL-D");
                         break;
                     }
                     Err(err) => {
-                        println!("Error: {:?}", err);
+                        eprintln!("Error: {:?}", err);
                         break;
                     }
                 }
+                println!();
             }
         }
-        Command::Query { query } => handle_query(&mut glue, &query).await,
+        Command::Query { query } => handle_query(&mut glue, &query).await?,
         Command::Tree { subdir } => {
             let sub_id = TableIdentifier::new(subdir.unwrap_or_default(), data_dir);
             let sub_name: TableName = sub_id.try_into()?;
