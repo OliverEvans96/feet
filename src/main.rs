@@ -33,8 +33,6 @@ enum Command {
     Query { query: String },
     /// List tables
     List { subdir: Option<String> },
-    /// Show schema for a table
-    Show { table_name: String },
     /// SQL repl
     Repl,
 }
@@ -222,7 +220,6 @@ async fn main() -> anyhow::Result<()> {
             //     println!("- {}", table);
             // }
         }
-        Command::Show { table_name } => {}
     }
 
     Ok(())
